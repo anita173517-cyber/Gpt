@@ -1,0 +1,162 @@
+name: RAM PLAYER v23.5 TV and Mobile Release APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "RAM_PLAYER_v23.5_GITHUB_READY.zip"
+      - ".github/workflows/ram-player-v23.5.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ram-player-v235-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate and extract the exact v23.5 source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_FILE="RAM_PLAYER_v23.5_GITHUB_READY.zip"
+          if [[ ! -f "$ZIP_FILE" ]]; then
+            echo "::error::Expected source archive '$ZIP_FILE' was not found at repository root."
+            echo "Repository files:"
+            find . -maxdepth 2 -type f -print | sort
+            exit 1
+          fi
+
+          EXTRACT_DIR="${RUNNER_TEMP}/ram-player-v235-source"
+          rm -rf "$EXTRACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+          unzip -t "$ZIP_FILE"
+          unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
+
+          SETTINGS_FILE="$(find "$EXTRACT_DIR" -type f -name settings.gradle.kts -print -quit)"
+          if [[ -z "$SETTINGS_FILE" ]]; then
+            echo "::error::ZIP does not contain settings.gradle.kts."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+          test -s "$PROJECT_DIR/app/build.gradle.kts"
+          test -s "$PROJECT_DIR/scripts/verify_project.py"
+
+          # Copy the project root into the GitHub workspace, without recursively copying the ZIP.
+          cp -a "$PROJECT_DIR/." "$GITHUB_WORKSPACE/"
+          test -s settings.gradle.kts
+          test -s app/build.gradle.kts
+          test -s scripts/verify_project.py
+
+          echo "Source archive extracted successfully."
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install required Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [[ -z "$SDK_ROOT" ]]; then
+            echo "::error::Android SDK path was not configured."
+            exit 1
+          fi
+          echo "sdk.dir=$SDK_ROOT" > local.properties
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+          cache-disabled: false
+
+      - name: Verify ZIP project and v23.5 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 scripts/verify_project.py
+
+          grep -Fq 'versionCode = 235' app/build.gradle.kts
+          grep -Fq 'versionName = "23.5"' app/build.gradle.kts
+          grep -Fq 'create("tv")' app/build.gradle.kts
+          grep -Fq 'create("mobile")' app/build.gradle.kts
+
+      - name: Run TV and Mobile unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --no-configuration-cache \
+            testTvDebugUnitTest testMobileDebugUnitTest \
+            --stacktrace --console=plain
+
+      - name: Build TV and Mobile release APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --no-configuration-cache \
+            assembleTvRelease assembleMobileRelease \
+            --stacktrace --console=plain
+
+          mkdir -p release_out
+
+          TV_DIR="app/build/outputs/apk/tv/release"
+          MOBILE_DIR="app/build/outputs/apk/mobile/release"
+
+          test -d "$TV_DIR"
+          test -d "$MOBILE_DIR"
+
+          # Prefer armeabi-v7a for older/low-end Android TVs; fall back only if absent.
+          TV_APK="$(find "$TV_DIR" -maxdepth 2 -type f -name '*armeabi-v7a*.apk' ! -name '*unsigned*.apk' -print -quit)"
+          if [[ -z "$TV_APK" ]]; then
+            TV_APK="$(find "$TV_DIR" -maxdepth 2 -type f -name '*.apk' ! -name '*unsigned*.apk' -print -quit)"
+          fi
+          test -n "$TV_APK"
+          test -s "$TV_APK"
+          unzip -t "$TV_APK" >/dev/null
+          cp "$TV_APK" release_out/RAM-PLAYER-v23.5-TV-Release.apk
+
+          # Prefer arm64-v8a for current Android phones; fall back only if absent.
+          MOBILE_APK="$(find "$MOBILE_DIR" -maxdepth 2 -type f -name '*arm64-v8a*.apk' ! -name '*unsigned*.apk' -print -quit)"
+          if [[ -z "$MOBILE_APK" ]]; then
+            MOBILE_APK="$(find "$MOBILE_DIR" -maxdepth 2 -type f -name '*.apk' ! -name '*unsigned*.apk' -print -quit)"
+          fi
+          test -n "$MOBILE_APK"
+          test -s "$MOBILE_APK"
+          unzip -t "$MOBILE_APK" >/dev/null
+          cp "$MOBILE_APK" release_out/RAM-PLAYER-v23.5-Mobile-Release.apk
+
+          sha256sum release_out/*.apk
+          ls -lh release_out/
+
+      - name: Upload TV and Mobile APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: RAM-PLAYER-v23.5-TV-and-Mobile-Release-APKs
+          path: |
+            release_out/RAM-PLAYER-v23.5-TV-Release.apk
+            release_out/RAM-PLAYER-v23.5-Mobile-Release.apk
+          if-no-files-found: error
+          retention-days: 14
